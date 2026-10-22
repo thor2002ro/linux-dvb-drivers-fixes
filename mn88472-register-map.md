@@ -1,6 +1,6 @@
 # MN88472 register reference
 
-The driver uses 49 named register start addresses across 61 register operations.
+The driver uses 49 named register start addresses.
 Definitions and settings live in
 [`mn88472_priv.h`](upstream/linux/drivers/media/dvb-frontends/mn88472_priv.h);
 [`mn88472.c`](upstream/linux/drivers/media/dvb-frontends/mn88472.c) uses them directly.
@@ -19,6 +19,24 @@ Bandwidth coefficient byte strings remain unchanged calibration data.
 IMPSET, FDAGCSET, TGAINSET and FECSET3 retain SDK names: their individual fields
 are not established here. Recipe constants describe existing Linux settings;
 they do not import different vendor tuning values.
+
+Idle power control uses standby (PWDSET=0x3e). Probe only writes power
+control; the sleep callback writes HIZSET2=0x30, HIZSET1=0x30, then PWDSET=0x3e.
+Both use mn88472_power_sleep for the standby power write. Power and output
+write failures are logged with their stage and errno without dynamic debug.
+The vendor MN_DMD_driver.h power-mode enum documents standby as keeping I2C
+and the clock running; sleep (0x3f) stops them and requires a hardware reset.
+The Xbox bridge resets the demodulator during attachment, not normal wake,
+and the frontend has no hardware-reset callback. Therefore 0x3f is unsuitable
+for the existing probe/sleep and I2C-only wake sequence.
+The experimental mode-2 sequence was withdrawn after a reported tuning failure.
+Wake-up retains PWDSET=0x00, HIZSET1=0x00, HIZSET2=0x00 and the firmware-running
+check. The reset requirement explains a source-level incompatibility; the exact
+failed hardware operation still requires the new initialization diagnostics.
+
+The linked Supra SDT-120 schematic documents another MN88472 board with an
+MxL603 tuner and 20.48 MHz crystal; it does not establish HIZ bit-to-pin
+assignments or justify changing the Xbox board's tuner/clock configuration.
 
 | Bank index / I2C address | Register | Driver name | SDK symbol and meaning |
 | --- | --- | --- | --- |
@@ -72,4 +90,4 @@ they do not import different vendor tuning values.
 | 2 / 0x1c | `0xf8` | `MN88472_REG_RESET_CONTROL` | RSTSET1: Demodulator reset control |
 | 2 / 0x1c | `0xff` | `MN88472_REG_CHIP_ID` | CHIPRD: Chip identifier |
 
-Source SHA-256: `13e279689dadc15472e44be2adcad63ebcb1f0aef1c6eb99d9ff8d805288dd79`.
+Source SHA-256: `d8fae5733d8abd33dfbfd7e182fe89730079738550cd0653135ca4963849a93e`.
