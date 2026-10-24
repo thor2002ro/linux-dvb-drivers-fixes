@@ -7,6 +7,7 @@
 #   make LLVM=1             # force clang build (CachyOS kernels need this)
 #   make clean              # remove build outputs, even without headers
 #   make install            # build locally and install modified modules
+#   make firmware-install   # install bundled firmware for the target kernel
 #   make uninstall          # remove these overrides
 #   make dkms               # register, build, and install through DKMS
 #
@@ -54,9 +55,13 @@ module-names:
 install uninstall:
 	KERNELRELEASE="$(KERNELRELEASE)" KDIR="$(KDIR)" INSTALL_MOD_PATH="$(INSTALL_MOD_PATH)" ./build.sh $@
 
+firmware-install:
+	INSTALL_MOD_PATH="$(INSTALL_MOD_PATH)" ./firmware/install.sh "$(KERNELRELEASE)"
+
 dkms: SHELL := /bin/bash
 dkms: check-config
 	@command -v dkms >/dev/null || { echo "Install DKMS first." >&2; exit 1; }
+	@./firmware/install.sh --check
 	@set -e; \
 	kernelver="$(KERNELRELEASE)"; kernel_source_dir="$$(cd "$(KDIR)" && pwd -P)"; \
 	source ./dkms.conf; \
@@ -65,7 +70,7 @@ dkms: check-config
 	dkms_args=(-m "$$PACKAGE_NAME" -v "$$PACKAGE_VERSION" --sourcetree "$(DKMS_SOURCE_TREE)"); \
 	kernel_args=(-k "$$kernelver" --kernelsourcedir "$$kernel_source_dir"); \
 	$$sudo_cmd install -d "$$source_dir"; \
-	$$sudo_cmd cp -a Makefile dkms.conf upstream "$$source_dir/"; \
+	$$sudo_cmd cp -a Makefile dkms.conf firmware upstream "$$source_dir/"; \
 	$$sudo_cmd make -C "$$source_dir" clean; \
 	status=$$(dkms status "$${dkms_args[@]}"); \
 	if [ -z "$$status" ]; then \
@@ -87,4 +92,4 @@ diagnostic: dvb-check
 dvb-check: tools/dvb-check.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -O2 -Wall -Wextra -Werror $< $(LDFLAGS) -o $@
 
-.PHONY: all default modules check-config module-names install uninstall dkms clean diagnostic
+.PHONY: all default modules check-config module-names install uninstall firmware-install dkms clean diagnostic

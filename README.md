@@ -357,6 +357,7 @@ source:
 make                  # builds all eleven modified modules
 make clean            # removes module build outputs and dvb-check; no headers needed
 make install          # same as ./build.sh install
+make firmware-install # install only bundled firmware; no headers needed
 make uninstall        # same as ./build.sh uninstall
 make dkms             # register, build, and install through DKMS (uses sudo)
 ./build.sh install    # builds locally, then installs the modified modules (also the default)
@@ -383,6 +384,15 @@ against that exact kernel and architecture. Stop tuner users before manually
 reloading the drivers, or reboot after installation or removal. Uninstall
 removes only these overrides, preserving stock kernel modules and local build
 outputs.
+
+The [bundled firmware](firmware/README.md) includes the verified MN88472,
+MN88473 and DiB0700 images for the Astrometa and Xbox tuners. Manual installation
+and the DKMS post-install hook check their SHA-256 hashes and replace firmware
+overrides under `/lib/firmware/updates/<kernel-release>/`. Linux searches that
+directory before distribution firmware copies. Installation works offline;
+`INSTALL_MOD_PATH` also stages the firmware under the selected root. Firmware
+is retained on module uninstall for use by the stock drivers. Reconnect the
+tuner or reboot to load the installed image.
 
 ### DKMS
 
