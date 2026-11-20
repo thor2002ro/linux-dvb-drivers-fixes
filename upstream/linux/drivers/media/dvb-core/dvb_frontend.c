@@ -97,6 +97,7 @@ struct dvb_frontend_private {
 	struct dvb_frontend_parameters parameters_out;
 	struct dvb_fe_events events;
 	struct semaphore sem;
+	bool removed;
 	struct list_head list_head;
 	wait_queue_head_t wait_queue;
 	struct task_struct *thread;
@@ -271,13 +272,10 @@ static void dvb_frontend_add_event(struct dvb_frontend *fe,
 static int dvb_frontend_test_event(struct dvb_frontend_private *fepriv,
 				   struct dvb_fe_events *events)
 {
-	int ret;
-
 	up(&fepriv->sem);
-	ret = events->eventw != events->eventr;
 	down(&fepriv->sem);
 
-	return ret;
+	return fepriv->removed || events->eventw != events->eventr;
 }
 
 static int dvb_frontend_get_event(struct dvb_frontend *fe,
@@ -310,6 +308,8 @@ static int dvb_frontend_get_event(struct dvb_frontend *fe,
 			}
 		}
 		remove_wait_queue(&events->wait_queue, &wait);
+		if (fepriv->removed)
+			return -ENODEV;
 		if (ret < 0)
 			return ret;
 	}
@@ -822,7 +822,6 @@ static void dvb_frontend_stop(struct dvb_frontend *fe)
 
 	kthread_stop(fepriv->thread);
 
-	sema_init(&fepriv->sem, 1);
 	fepriv->state = FESTATE_IDLE;
 
 	/* paranoia check in case a signal arrived */
@@ -2068,11 +2067,10 @@ static int dvb_frontend_do_ioctl(struct file *file, unsigned int cmd,
 	struct dvb_frontend_private *fepriv = fe->frontend_priv;
 	int err;
 
-	dev_dbg(fe->dvb->device, "%s: (%d)\n", __func__, _IOC_NR(cmd));
 	if (down_interruptible(&fepriv->sem))
 		return -ERESTARTSYS;
 
-	if (fe->exit != DVB_FE_NO_EXIT) {
+	if (fepriv->removed || fe->exit != DVB_FE_NO_EXIT) {
 		up(&fepriv->sem);
 		return -ENODEV;
 	}
@@ -2246,7 +2244,10 @@ static long dvb_frontend_compat_ioctl(struct file *file, unsigned int cmd,
 		if (down_interruptible(&fepriv->sem))
 			return -ERESTARTSYS;
 
-		err = dvb_frontend_handle_compat_ioctl(file, cmd, arg);
+		if (fepriv->removed || fe->exit != DVB_FE_NO_EXIT)
+			err = -ENODEV;
+		else
+			err = dvb_frontend_handle_compat_ioctl(file, cmd, arg);
 
 		up(&fepriv->sem);
 		return err;
@@ -2751,9 +2752,9 @@ static __poll_t dvb_frontend_poll(struct file *file, struct poll_table_struct *w
 	struct dvb_frontend *fe = dvbdev->priv;
 	struct dvb_frontend_private *fepriv = fe->frontend_priv;
 
-	dev_dbg_ratelimited(fe->dvb->device, "%s:\n", __func__);
-
 	poll_wait(file, &fepriv->events.wait_queue, wait);
+	if (READ_ONCE(fepriv->removed))
+		return EPOLLHUP | EPOLLERR;
 
 	if (fepriv->events.eventw != fepriv->events.eventr)
 		return (EPOLLIN | EPOLLRDNORM | EPOLLPRI);
@@ -2874,10 +2875,12 @@ static int dvb_frontend_open(struct inode *inode, struct file *file)
 {
 	struct dvb_device *dvbdev = file->private_data;
 	struct dvb_frontend *fe = dvbdev->priv;
+	struct dvb_frontend_private *fepriv = fe->frontend_priv;
 	struct dvb_adapter *adapter = fe->dvb;
 
 	dev_dbg(fe->dvb->device, "%s:\n", __func__);
-	if (fe->exit == DVB_FE_DEVICE_REMOVED)
+	if (READ_ONCE(fepriv->removed) ||
+	    fe->exit == DVB_FE_DEVICE_REMOVED)
 		return -ENODEV;
 
 	if (!adapter->mfe_shared)
@@ -2927,7 +2930,7 @@ static int dvb_frontend_release(struct inode *inode, struct file *file)
 	struct dvb_frontend_private *fepriv = fe->frontend_priv;
 	int ret;
 
-	dev_dbg(fe->dvb->device, "%s:\n", __func__);
+	down(&fepriv->sem);
 
 	if ((file->f_flags & O_ACCMODE) != O_RDONLY) {
 		fepriv->release_jiffies = jiffies;
@@ -2936,7 +2939,7 @@ static int dvb_frontend_release(struct inode *inode, struct file *file)
 
 	ret = dvb_generic_release(inode, file);
 
-	if (dvbdev->users == -1) {
+	if (!fepriv->removed && dvbdev->users == -1) {
 		wake_up(&fepriv->wait_queue);
 #ifdef CONFIG_MEDIA_CONTROLLER_DVB
 		mutex_lock(&fe->dvb->mdev_lock);
@@ -2953,6 +2956,7 @@ static int dvb_frontend_release(struct inode *inode, struct file *file)
 		if (fe->ops.ts_bus_ctrl)
 			fe->ops.ts_bus_ctrl(fe, 0);
 	}
+	up(&fepriv->sem);
 
 	dvb_frontend_put(fe);
 
@@ -3099,8 +3103,13 @@ int dvb_unregister_frontend(struct dvb_frontend *fe)
 	dev_dbg(fe->dvb->device, "%s:\n", __func__);
 
 	mutex_lock(&frontend_mutex);
-	dvb_frontend_stop(fe);
+	/* Open files can outlive the adapter, so stop their callbacks first. */
+	down(&fepriv->sem);
+	WRITE_ONCE(fepriv->removed, true);
+	up(&fepriv->sem);
+	wake_up_interruptible(&fepriv->events.wait_queue);
 	dvb_remove_device(fepriv->dvbdev);
+	dvb_frontend_stop(fe);
 
 	/* fe is invalid now */
 	mutex_unlock(&frontend_mutex);
