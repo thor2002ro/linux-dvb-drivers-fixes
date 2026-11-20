@@ -212,12 +212,13 @@ unlock:
 int usb_urb_kill(struct usb_data_stream *stream)
 {
 	WRITE_ONCE(stream->running, false);
-	cancel_delayed_work_sync(&stream->recovery_work);
 
 	mutex_lock(&stream->recovery_lock);
 	usb_urb_kill_locked(stream);
 	WRITE_ONCE(stream->recovering, false);
 	mutex_unlock(&stream->recovery_lock);
+	/* Completions that saw running=true can still queue work until drained. */
+	cancel_delayed_work_sync(&stream->recovery_work);
 	return 0;
 }
 
@@ -394,7 +395,8 @@ int usb_urb_exit(struct usb_data_stream *stream)
 {
 	int i;
 
-	usb_urb_kill(stream);
+	if (stream->urbs_initialized)
+		usb_urb_kill(stream);
 
 	for (i = 0; i < stream->urbs_initialized; i++) {
 		if (stream->urb_list[i] != NULL) {
