@@ -16,11 +16,36 @@
 int usb_urb_reconfig(struct usb_data_stream *stream,
 		struct usb_data_stream_properties *props);
 
+struct dvb_usb_urb {
+	struct usb_data_stream *stream;
+	struct urb *urb;
+	struct work_struct resubmit_work;
+};
+
+static bool usb_urb_terminal_error(int ret)
+{
+	return ret == -ENODEV || ret == -ESHUTDOWN || ret == -ENOENT ||
+	       ret == -ECONNRESET || ret == -EPERM;
+}
+
+static void usb_urb_resubmit_work(struct work_struct *work)
+{
+	struct dvb_usb_urb *request = container_of(work, struct dvb_usb_urb,
+						   resubmit_work);
+	int ret;
+
+	ret = usb_submit_urb(request->urb, GFP_KERNEL);
+	if (ret && !usb_urb_terminal_error(ret))
+		dev_err_ratelimited(&request->stream->udev->dev,
+				    "stream URB resubmit failed: %d\n", ret);
+}
+
 static void usb_urb_complete(struct urb *urb)
 {
-	struct usb_data_stream *stream = urb->context;
+	struct dvb_usb_urb *request = urb->context;
+	struct usb_data_stream *stream = request->stream;
 	int ptype = usb_pipetype(urb->pipe);
-	int i;
+	int i, ret;
 	u8 *b;
 
 	dev_dbg_ratelimited(&stream->udev->dev,
@@ -37,11 +62,14 @@ static void usb_urb_complete(struct urb *urb)
 	case -ECONNRESET:   /* kill */
 	case -ENOENT:
 	case -ESHUTDOWN:
+	case -ENODEV:
 		return;
 	default:        /* error */
 		dev_dbg_ratelimited(&stream->udev->dev,
 				"%s: urb completion failed=%d\n",
 				__func__, urb->status);
+		if (ptype == PIPE_BULK)
+			goto resubmit;
 		break;
 	}
 
@@ -73,16 +101,24 @@ static void usb_urb_complete(struct urb *urb)
 				KBUILD_MODNAME);
 		return;
 	}
-	usb_submit_urb(urb, GFP_ATOMIC);
+resubmit:
+	ret = usb_submit_urb(urb, GFP_ATOMIC);
+	if (ret && !usb_urb_terminal_error(ret))
+		schedule_work(&request->resubmit_work);
 }
 
 int usb_urb_killv2(struct usb_data_stream *stream)
 {
 	int i;
+
 	for (i = 0; i < stream->urbs_submitted; i++) {
-		dev_dbg(&stream->udev->dev, "%s: kill urb=%d\n", __func__, i);
-		/* stop the URB */
-		usb_kill_urb(stream->urb_list[i]);
+		struct urb *urb = stream->urb_list[i];
+		struct dvb_usb_urb *request = urb->context;
+
+		/* Drain completions and block worker resubmission until it exits. */
+		usb_poison_urb(urb);
+		cancel_work_sync(&request->resubmit_work);
+		usb_unpoison_urb(urb);
 	}
 	stream->urbs_submitted = 0;
 	return 0;
@@ -98,6 +134,8 @@ int usb_urb_submitv2(struct usb_data_stream *stream,
 		if (ret < 0)
 			return ret;
 	}
+	if (!stream->urbs_initialized)
+		return -EINVAL;
 
 	for (i = 0; i < stream->urbs_initialized; i++) {
 		dev_dbg(&stream->udev->dev, "%s: submit urb=%d\n", __func__, i);
@@ -121,30 +159,50 @@ static int usb_urb_free_urbs(struct usb_data_stream *stream)
 	usb_urb_killv2(stream);
 
 	for (i = stream->urbs_initialized - 1; i >= 0; i--) {
-		if (stream->urb_list[i]) {
-			dev_dbg(&stream->udev->dev, "%s: free urb=%d\n",
-					__func__, i);
-			/* free the URBs */
-			usb_free_urb(stream->urb_list[i]);
-		}
+		struct urb *urb = stream->urb_list[i];
+
+		kfree(urb->context);
+		usb_free_urb(urb);
+		stream->urb_list[i] = NULL;
 	}
 	stream->urbs_initialized = 0;
 
 	return 0;
 }
 
+static struct urb *usb_urb_alloc(struct usb_data_stream *stream, int frames)
+{
+	struct dvb_usb_urb *request;
+	struct urb *urb;
+
+	request = kzalloc(sizeof(*request), GFP_KERNEL);
+	if (!request)
+		return NULL;
+
+	urb = usb_alloc_urb(frames, GFP_KERNEL);
+	if (!urb) {
+		kfree(request);
+		return NULL;
+	}
+
+	request->stream = stream;
+	request->urb = urb;
+	INIT_WORK(&request->resubmit_work, usb_urb_resubmit_work);
+	urb->context = request;
+	return urb;
+}
+
 static int usb_urb_alloc_bulk_urbs(struct usb_data_stream *stream)
 {
-	int i, j;
+	int i;
 
 	/* allocate the URBs */
 	for (i = 0; i < stream->props.count; i++) {
 		dev_dbg(&stream->udev->dev, "%s: alloc urb=%d\n", __func__, i);
-		stream->urb_list[i] = usb_alloc_urb(0, GFP_ATOMIC);
+		stream->urb_list[i] = usb_urb_alloc(stream, 0);
 		if (!stream->urb_list[i]) {
 			dev_dbg(&stream->udev->dev, "%s: failed\n", __func__);
-			for (j = 0; j < i; j++)
-				usb_free_urb(stream->urb_list[j]);
+			usb_urb_free_urbs(stream);
 			return -ENOMEM;
 		}
 		usb_fill_bulk_urb(stream->urb_list[i],
@@ -153,7 +211,7 @@ static int usb_urb_alloc_bulk_urbs(struct usb_data_stream *stream)
 						stream->props.endpoint),
 				stream->buf_list[i],
 				stream->props.u.bulk.buffersize,
-				usb_urb_complete, stream);
+				usb_urb_complete, stream->urb_list[i]->context);
 
 		stream->urbs_initialized++;
 	}
@@ -169,19 +227,17 @@ static int usb_urb_alloc_isoc_urbs(struct usb_data_stream *stream)
 		struct urb *urb;
 		int frame_offset = 0;
 		dev_dbg(&stream->udev->dev, "%s: alloc urb=%d\n", __func__, i);
-		stream->urb_list[i] = usb_alloc_urb(
-				stream->props.u.isoc.framesperurb, GFP_ATOMIC);
+		stream->urb_list[i] = usb_urb_alloc(stream,
+				stream->props.u.isoc.framesperurb);
 		if (!stream->urb_list[i]) {
 			dev_dbg(&stream->udev->dev, "%s: failed\n", __func__);
-			for (j = 0; j < i; j++)
-				usb_free_urb(stream->urb_list[j]);
+			usb_urb_free_urbs(stream);
 			return -ENOMEM;
 		}
 
 		urb = stream->urb_list[i];
 
 		urb->dev = stream->udev;
-		urb->context = stream;
 		urb->complete = usb_urb_complete;
 		urb->pipe = usb_rcvisocpipe(stream->udev,
 				stream->props.endpoint);
@@ -257,7 +313,7 @@ int usb_urb_reconfig(struct usb_data_stream *stream,
 
 	/* check allocated buffers are large enough for the request */
 	if (props->type == USB_BULK) {
-		buf_size = stream->props.u.bulk.buffersize;
+		buf_size = props->u.bulk.buffersize;
 	} else if (props->type == USB_ISOC) {
 		buf_size = props->u.isoc.framesize * props->u.isoc.framesperurb;
 	} else {
@@ -274,7 +330,8 @@ int usb_urb_reconfig(struct usb_data_stream *stream,
 	}
 
 	/* check if all fields are same */
-	if (stream->props.type == props->type &&
+	if (stream->urbs_initialized == props->count &&
+			stream->props.type == props->type &&
 			stream->props.count == props->count &&
 			stream->props.endpoint == props->endpoint) {
 		if (props->type == USB_BULK &&
