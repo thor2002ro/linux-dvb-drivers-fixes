@@ -809,8 +809,7 @@ static int tda18250_probe(struct i2c_client *client)
 	ret = regmap_bulk_read(dev->regmap, R00_ID1, &chip_id, 3);
 	if (ret)
 		goto err_kfree;
-	dev_dbg(&client->dev, "chip_id=%02x:%02x:%02x",
-			chip_id[0], chip_id[1], chip_id[2]);
+	dev_dbg(&client->dev, "chip_id=%3phC", chip_id);
 
 	switch (chip_id[0]) {
 	case 0xc7:
