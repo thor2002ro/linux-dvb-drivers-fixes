@@ -56,7 +56,8 @@ enum cxd2841er_state {
 	STATE_SLEEP_S,
 	STATE_ACTIVE_S,
 	STATE_SLEEP_TC,
-	STATE_ACTIVE_TC
+	STATE_ACTIVE_TC,
+	STATE_INVALID
 };
 
 struct cxd2841er_priv {
@@ -73,6 +74,7 @@ struct cxd2841er_priv {
 	u32				flags;
 	unsigned long			stats_time;
 	int				tune_error;
+	bool			retry_tune;
 };
 
 static const struct cxd2841er_cnr_data s_cn_data[] = {
@@ -1270,7 +1272,7 @@ static int cxd2841er_shutdown_to_sleep_s(struct cxd2841er_priv *priv)
 	int ret;
 
 	dev_dbg(&priv->i2c->dev, "%s()\n", __func__);
-	if (priv->state != STATE_SHUTDOWN) {
+	if (priv->state != STATE_SHUTDOWN && priv->state != STATE_INVALID) {
 		dev_dbg(&priv->i2c->dev, "%s(): invalid demod state %d\n",
 			__func__, priv->state);
 		return -EINVAL;
@@ -1404,7 +1406,7 @@ static int cxd2841er_shutdown_to_sleep_tc(struct cxd2841er_priv *priv)
 	u8 data = 0;
 
 	dev_dbg(&priv->i2c->dev, "%s()\n", __func__);
-	if (priv->state != STATE_SHUTDOWN) {
+	if (priv->state != STATE_SHUTDOWN && priv->state != STATE_INVALID) {
 		dev_dbg(&priv->i2c->dev, "%s(): invalid demod state %d\n",
 			__func__, priv->state);
 		return -EINVAL;
@@ -5928,6 +5930,12 @@ done:
 	return ret;
 }
 
+static bool cxd2841er_retryable_tune_error(int error)
+{
+	return error == -EAGAIN || error == -ETIMEDOUT || error == -EIO ||
+	       error == -EREMOTEIO || error == -EPIPE;
+}
+
 static int cxd2841er_tune_s(struct dvb_frontend *fe,
 			    bool re_tune,
 			    unsigned int mode_flags,
@@ -5937,15 +5945,20 @@ static int cxd2841er_tune_s(struct dvb_frontend *fe,
 	int ret, carrier_offset;
 	struct cxd2841er_priv *priv = fe->demodulator_priv;
 	struct dtv_frontend_properties *p = &fe->dtv_property_cache;
+	bool allow_retry = re_tune && !(mode_flags & FE_TUNE_MODE_ONESHOT);
+	u32 frequency = p->frequency;
 
 	*status = 0;
 	*delay = HZ / 5;
+	if (!(mode_flags & FE_TUNE_MODE_ONESHOT))
+		re_tune |= priv->retry_tune;
+	priv->retry_tune = false;
 
 	dev_dbg(&priv->i2c->dev, "%s() re_tune=%d\n", __func__, re_tune);
 	if (re_tune) {
 		ret = cxd2841er_set_frontend_s(fe);
 		if (ret)
-			goto error;
+			goto setup_error;
 		ret = cxd2841er_read_status_s(fe, status);
 		if (ret)
 			goto error;
@@ -5956,13 +5969,16 @@ static int cxd2841er_tune_s(struct dvb_frontend *fe,
 			p->frequency += carrier_offset;
 			ret = cxd2841er_set_frontend_s(fe);
 			if (ret)
-				goto error;
+				goto setup_error;
 		}
 	}
 	ret = cxd2841er_read_status_s(fe, status);
 	if (ret)
 		goto error;
 	return 0;
+setup_error:
+	p->frequency = frequency;
+	priv->retry_tune = allow_retry && cxd2841er_retryable_tune_error(ret);
 error:
 	*status = 0;
 	return ret;
@@ -5977,16 +5993,21 @@ static int cxd2841er_tune_tc(struct dvb_frontend *fe,
 	int ret, carrier_offset;
 	struct cxd2841er_priv *priv = fe->demodulator_priv;
 	struct dtv_frontend_properties *p = &fe->dtv_property_cache;
+	bool allow_retry = re_tune && !(mode_flags & FE_TUNE_MODE_ONESHOT);
+	u32 frequency = p->frequency;
 
 	*status = 0;
 	*delay = HZ / 5;
+	if (!(mode_flags & FE_TUNE_MODE_ONESHOT))
+		re_tune |= priv->retry_tune;
+	priv->retry_tune = false;
 
 	dev_dbg(&priv->i2c->dev, "%s(): re_tune %d bandwidth=%d\n", __func__,
 			re_tune, p->bandwidth_hz);
 	if (re_tune) {
 		ret = cxd2841er_set_frontend_tc(fe);
 		if (ret)
-			goto error;
+			goto setup_error;
 		ret = cxd2841er_read_status_tc(fe, status);
 		if (ret)
 			goto error;
@@ -6031,13 +6052,16 @@ static int cxd2841er_tune_tc(struct dvb_frontend *fe,
 			p->frequency += carrier_offset;
 			ret = cxd2841er_set_frontend_tc(fe);
 			if (ret)
-				goto error;
+				goto setup_error;
 		}
 	}
 	ret = cxd2841er_read_status_tc(fe, status);
 	if (ret)
 		goto error;
 	return 0;
+setup_error:
+	p->frequency = frequency;
+	priv->retry_tune = allow_retry && cxd2841er_retryable_tune_error(ret);
 error:
 	*status = 0;
 	return ret;
@@ -6050,6 +6074,9 @@ static int cxd2841er_sleep_s(struct dvb_frontend *fe)
 	struct cxd2841er_priv *priv = fe->demodulator_priv;
 
 	dev_dbg(&priv->i2c->dev, "%s()\n", __func__);
+	priv->retry_tune = false;
+	if (priv->state == STATE_INVALID)
+		return priv->tune_error;
 	if (priv->state == STATE_SHUTDOWN)
 		return 0;
 	if (priv->state == STATE_ACTIVE_S) {
@@ -6062,6 +6089,7 @@ static int cxd2841er_sleep_s(struct dvb_frontend *fe)
 		goto error;
 	return 0;
 error:
+	priv->state = STATE_INVALID;
 	priv->tune_error = ret;
 	return ret;
 }
@@ -6110,6 +6138,7 @@ static int cxd2841er_sleep_tc(struct dvb_frontend *fe)
 	}
 	return 0;
 error:
+	priv->state = STATE_INVALID;
 	priv->tune_error = ret;
 	return ret;
 }
@@ -6121,14 +6150,19 @@ static int cxd2841er_shutdown_tc(struct dvb_frontend *fe)
 
 	dev_dbg(&priv->i2c->dev, "%s()\n", __func__);
 
+	priv->retry_tune = false;
+	if (priv->state == STATE_INVALID)
+		return priv->tune_error;
 	if (priv->state == STATE_SHUTDOWN)
 		return 0;
 	ret = cxd2841er_sleep_tc(fe);
 	if (ret)
 		return ret;
 	ret = cxd2841er_sleep_tc_to_shutdown(priv);
-	if (ret)
+	if (ret) {
+		priv->state = STATE_INVALID;
 		priv->tune_error = ret;
+	}
 	return ret;
 }
 
@@ -6278,10 +6312,7 @@ static int cxd2841er_send_diseqc_msg(struct dvb_frontend *fe,
 
 static void cxd2841er_release(struct dvb_frontend *fe)
 {
-	struct cxd2841er_priv *priv  = fe->demodulator_priv;
-
-	dev_dbg(&priv->i2c->dev, "%s()\n", __func__);
-	kfree(priv);
+	kfree(fe->demodulator_priv);
 }
 
 static int cxd2841er_i2c_gate_ctrl(struct dvb_frontend *fe, int enable)
@@ -6394,6 +6425,7 @@ static int cxd2841er_init_s(struct dvb_frontend *fe)
 	priv->tune_error = 0;
 	return 0;
 error:
+	priv->state = STATE_INVALID;
 	priv->tune_error = ret;
 	return ret;
 }
@@ -6465,6 +6497,7 @@ static int cxd2841er_init_tc(struct dvb_frontend *fe)
 	priv->tune_error = 0;
 	return 0;
 error:
+	priv->state = STATE_INVALID;
 	priv->tune_error = ret;
 	return ret;
 }
